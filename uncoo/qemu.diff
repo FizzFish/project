@@ -1,0 +1,1216 @@
+diff --git a/.gitignore b/.gitignore
+index cf653168..411ab3f8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -109,6 +109,8 @@
+ /docs/interop/qemu-qmp-ref.info*
+ /docs/interop/qemu-qmp-ref.txt
+ /docs/version.texi
++/roms/seabios/config.mak
++/roms/vgabios/config.mak
+ *.tps
+ .stgit-*
+ cscope.*
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index d84b01d1..ce5016b4 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -35,6 +35,8 @@
+ #endif
+ #include "sysemu/cpus.h"
+ #include "sysemu/replay.h"
++#include "qemu-cfg.h"
++#include "instrument.h"
+ 
+ /* -icount align implementation. */
+ 
+@@ -53,6 +55,7 @@ typedef struct SyncClocks {
+ #define THRESHOLD_REDUCE 1.5
+ #define MAX_DELAY_PRINT_RATE 2000000000LL
+ #define MAX_NB_PRINTS 100
++//uint64_t env_old_pc, env_new_pc;
+ 
+ static void align_clocks(SyncClocks *sc, const CPUState *cpu)
+ {
+@@ -144,6 +147,8 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     int tb_exit;
+     uint8_t *tb_ptr = itb->tc_ptr;
+ 
++        //AFL_QEMU_CPU_SNIPPET2;
++
+     qemu_log_mask_and_addr(CPU_LOG_EXEC, itb->pc,
+                            "Trace %p [%d: " TARGET_FMT_lx "] %s\n",
+                            itb->tc_ptr, cpu->cpu_index, itb->pc,
+@@ -329,6 +334,8 @@ TranslationBlock *tb_htable_lookup(CPUState *cpu, target_ulong pc,
+     return qht_lookup(&tcg_ctx.tb_ctx.htable, tb_cmp, &desc, h);
+ }
+ 
++extern int cfg_explore;
++
+ static inline TranslationBlock *tb_find(CPUState *cpu,
+                                         TranslationBlock *last_tb,
+                                         int tb_exit)
+@@ -338,6 +345,7 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
+     target_ulong cs_base, pc;
+     uint32_t flags;
+     bool have_tb_lock = false;
++    bool find_fast = true;
+ 
+     /* we record a subset of the CPU state. It will
+        always be the same before a given translated block
+@@ -364,7 +372,10 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
+             tb = tb_htable_lookup(cpu, pc, cs_base, flags);
+             if (!tb) {
+                 /* if no translated code available, then translate it now */
++                find_fast = false;
+                 tb = tb_gen_code(cpu, pc, cs_base, flags, 0);
++                if (!do_cfg && !pre_strace)
++                    AFL_QEMU_CPU_SNIPPET1;
+             }
+ 
+             mmap_unlock();
+@@ -373,6 +384,30 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
+         /* We add the TB in the virtual pc hash table for the fast lookup */
+         atomic_set(&cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)], tb);
+     }
++    /* 1. CFG mode:
++     *  1.1. entry_point: afl_setup, afl_forkserver
++     *  1.2. find_fast: mark tb
++     *      1.2.1. cfg_explore: return and restore_last_branch
++     * 2. No cfg mode: afl_maybe_log
++     */
++    if (tb->pc == afl_entry_point) {
++        if (afl_setup()) {
++            do_cfg = 1;
++            tb_unlock();
++            afl_forkserver(cpu);
++            // child will reach there
++            tb_lock();
++        }
++    }
++    if(do_cfg) {
++        if (find_fast) {
++            afl_mark_cfg(tb->pc);
++            if (cfg_explore)
++                return NULL;
++        }
++    } else if ((fuzz_strace || fuzz_normal) && last_tb) {
++        afl_maybe_log(last_tb->pc, tb->pc);
++    }
+ #ifndef CONFIG_USER_ONLY
+     /* We don't take care of direct jumps when address mapping changes in
+      * system emulation. So it's not safe to make a direct jump to a TB
+@@ -621,11 +656,16 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+ 
+ /* main execution loop */
+ 
++extern target_ulong jmp_pc1, jmp_pc2;
++extern bool jmp_exit;
++//extern int do_cfg;
++
+ int cpu_exec(CPUState *cpu)
+ {
+     CPUClass *cc = CPU_GET_CLASS(cpu);
+     int ret;
+     SyncClocks sc = { 0 };
++    CPUArchState *env = (CPUArchState *)cpu->env_ptr;
+ 
+     /* replay_interrupt may need current_cpu */
+     current_cpu = cpu;
+@@ -672,8 +712,32 @@ int cpu_exec(CPUState *cpu)
+         int tb_exit = 0;
+ 
+         while (!cpu_handle_interrupt(cpu, &last_tb)) {
++            uint64_t start_pc = env->eip;
+             TranslationBlock *tb = tb_find(cpu, last_tb, tb_exit);
++            if(cfg_explore && !tb) { // find old tb
++                if(last_tb)
++                    graph_add_edge(last_tb->pc, start_pc);
++                return EXCP_EXPLORE;
++            }
++            // gen_jcc generate jmp_pc1, jmp_pc2, jmp_exit
+             cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
++            if(cfg_explore && (env->eip < afl_start_code || env->eip > afl_end_code))
++                return EXCP_EXPLORE;
++            if (do_cfg && jmp_exit)
++            {
++                uint64_t exit_pc = env->eip;
++                graph_add_edge(start_pc, jmp_pc1);
++                graph_add_edge(start_pc, jmp_pc2);
++                if (exit_pc == jmp_pc1) {
++                    branch_list_add(env, jmp_pc2);
++                } else if(exit_pc == jmp_pc2) {
++                    branch_list_add(env, jmp_pc1);
++                } else {
++                    // shouldnot be there
++                    ;//printf("%lx %lx %lx\n", jmp_pc1, jmp_pc2, exit_pc);
++                }
++                jmp_exit = 0;
++            }
+             /* Try to align the host and virtual clocks
+                if the guest is in advance */
+             align_clocks(&sc, cpu);
+diff --git a/accel/tcg/instrument.h b/accel/tcg/instrument.h
+new file mode 100644
+index 00000000..85e83a69
+--- /dev/null
++++ b/accel/tcg/instrument.h
+@@ -0,0 +1,396 @@
++/*
++  Copyright 2015 Google LLC All rights reserved.
++
++  Licensed under the Apache License, Version 2.0 (the "License");
++  you may not use this file except in compliance with the License.
++  You may obtain a copy of the License at:
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++*/
++
++/*
++   american fuzzy lop - high-performance binary-only instrumentation
++   -----------------------------------------------------------------
++
++   Written by Andrew Griffiths <agriffiths@google.com> and
++              Michal Zalewski <lcamtuf@google.com>
++
++   Idea & design very much by Andrew Griffiths.
++
++   This code is a shim patched into the separately-distributed source
++   code of QEMU 2.10.0. It leverages the built-in QEMU tracing functionality
++   to implement AFL-style instrumentation and to take care of the remaining
++   parts of the AFL fork server logic.
++
++   The resulting QEMU binary is essentially a standalone instrumentation
++   tool; for an example of how to leverage it for other purposes, you can
++   have a look at afl-showmap.c.
++*/
++
++#include <sys/shm.h>
++#include "afl-info.h"
++
++/***************************
++ * VARIOUS AUXILIARY STUFF *
++ ***************************/
++
++/* A snippet patched into tb_find_slow to inform the parent process that
++   we have hit a new block that hasn't been translated yet, and to tell
++   it to translate within its own context, too (this avoids translation
++   overhead in the next forked-off copy). */
++
++#define CFG 0
++#define PRE_STRACE 1
++#define FUZZ_STRACE 2
++#define NORMAL 3
++
++extern int pre_syscalls[PRE_SYS_NUM];
++struct qht_map {
++    struct rcu_head rcu;
++    struct qht_bucket *buckets;
++    size_t n_buckets;
++    size_t n_added_buckets;
++    size_t n_added_buckets_threshold;
++};
++
++#define AFL_QEMU_CPU_SNIPPET1 do { \
++    afl_request_tsl(pc, cs_base, flags); \
++  } while (0)
++
++/* We use one additional file descriptor to relay "needs translation"
++   messages between the child and the fork server. */
++
++
++/* This is equivalent to afl-as.h: */
++
++static unsigned char *afl_area_ptr;
++
++/* Exported variables populated by the code patched into elfload.c: */
++
++extern abi_ulong afl_entry_point, /* ELF entry point (_start) */
++          afl_start_code,  /* .text start pointer      */
++          afl_end_code;    /* .text end pointer        */
++
++/* Set in the child process in forkserver mode: */
++
++static unsigned char afl_fork_child;
++extern int pre_strace;
++extern int fuzz_strace;
++extern int fuzz_normal;
++extern int do_cfg;
++
++/* Instrumentation ratio: */
++
++static unsigned int afl_inst_rms = MAP_SIZE;
++
++/* Function declarations. */
++
++static bool afl_setup(void);
++static void afl_forkserver(CPUState*);
++static inline void afl_maybe_log(abi_ulong, abi_ulong);
++
++static void afl_wait_tsl(CPUState*, int);
++static void afl_request_tsl(target_ulong, target_ulong, uint64_t);
++static void afl_wait_cfg(int fd);
++static void afl_wait_syscall(int fd);
++
++/* Data structure passed around by the translate handlers: */
++
++struct afl_tsl {
++  target_ulong pc;
++  target_ulong cs_base;
++  uint64_t flags;
++};
++
++/* Some forward decls: */
++
++//TranslationBlock *tb_htable_lookup(CPUState*, target_ulong, target_ulong, uint32_t);
++static inline TranslationBlock *tb_find(CPUState*, TranslationBlock*, int);
++
++/*************************
++ * ACTUAL IMPLEMENTATION *
++ *************************/
++
++/* Set up SHM region and initialize other stuff. */
++
++static bool afl_setup(void) {
++
++  char *id_str = getenv(SHM_ENV_VAR),
++       *inst_r = getenv("AFL_INST_RATIO");
++
++  int shm_id;
++
++  if (inst_r) {
++
++    unsigned int r;
++
++    r = atoi(inst_r);
++
++    if (r > 100) r = 100;
++    if (!r) r = 1;
++
++    afl_inst_rms = MAP_SIZE * r / 100;
++
++  }
++
++  if (id_str) {
++
++    shm_id = atoi(id_str);
++    afl_area_ptr = shmat(shm_id, NULL, 0);
++
++    if (afl_area_ptr == (void*)-1) exit(1);
++
++    /* With AFL_INST_RATIO set to a low value, we want to touch the bitmap
++       so that the parent doesn't give up on us. */
++
++    if (inst_r) afl_area_ptr[0] = 1;
++
++
++  } else
++      return false;
++
++  if (getenv("AFL_INST_LIBS")) {
++
++    afl_start_code = 0;
++    afl_end_code   = (abi_ulong)-1;
++
++  }
++
++  /* pthread_atfork() seems somewhat broken in util/rcu.c, and I'm
++     not entirely sure what is the cause. This disables that
++     behaviour, and seems to work alright? */
++
++  rcu_disable_atfork();
++  return true;
++
++}
++
++
++/* Fork server logic, invoked once we hit _start. */
++extern struct qht cfg_htable;
++static void afl_forkserver(CPUState *cpu) {
++
++  static unsigned char tmp[4];
++  static int mode = 0;
++
++  if (!afl_area_ptr) return;
++
++  /* Tell the parent that we're alive. If the parent doesn't want
++     to talk, assume that we're not running in forkserver mode. */
++
++  if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
++
++  afl_forksrv_pid = getpid();
++
++  /* All right, let's await orders... */
++  while (1) {
++
++    pid_t child_pid;
++    int status, t_fd[2];
++
++    /* Whoops, parent dead? */
++
++    if (read(FORKSRV_FD, &mode, 4) != 4) exit(2);
++    if (mode == CFG) {
++        do_cfg = 1;
++    } else if (mode == PRE_STRACE) {
++        do_cfg = 0;
++        pre_strace = 1;
++    } else if (mode == FUZZ_STRACE) {
++        pre_strace = 0;
++        fuzz_strace = 1;
++    } else {
++        pre_strace = 0;
++        fuzz_normal = 1;
++    }
++
++    /* Establish a channel with child to grab translation commands. We'll
++       read from t_fd[0], child will write to TSL_FD. */
++
++    if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
++    close(t_fd[1]);
++
++    child_pid = fork();
++    if (child_pid < 0) exit(4);
++
++    if (!child_pid) {
++
++      /* Child process. Close descriptors and run free. */
++
++      afl_fork_child = 1;
++      close(FORKSRV_FD);
++      close(FORKSRV_FD + 1);
++      close(t_fd[0]);
++      return;
++
++    }
++
++    /* Parent. */
++
++    close(TSL_FD);
++
++    if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
++
++    /* Collect translation requests until child dies and closes the pipe. */
++    if(mode == CFG)
++        afl_wait_cfg(t_fd[0]);
++    else if(mode == PRE_STRACE)
++        afl_wait_syscall(t_fd[0]);
++    else
++        afl_wait_tsl(cpu, t_fd[0]);
++
++    /* Get and relay exit status to parent. */
++    if (waitpid(child_pid, &status, 0) < 0) exit(6);
++    if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
++
++  }
++
++}
++
++
++/* The equivalent of the tuple logging routine from afl-as.h. */
++extern int no_exit;
++
++static inline void afl_maybe_log(abi_ulong prev_loc, abi_ulong cur_loc) {
++
++  /* Optimize for cur_loc > afl_end_code, which is the most likely case on
++     Linux systems. */
++  if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
++    return;
++
++  if (no_exit && !cfg_htable_lookup(cur_loc))
++    return;
++
++  /* Looks like QEMU always maps to fixed locations, so ASAN is not a
++     concern. Phew. But instruction addresses may be aligned. Let's mangle
++     the value to get something quasi-uniform. */
++
++  prev_loc  = (prev_loc >> 4) ^ (prev_loc << 8);
++  prev_loc &= MAP_SIZE - 1;
++
++  cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8);
++  cur_loc &= MAP_SIZE - 1;
++
++  /* Implement probabilistic instrumentation by looking at scrambled block
++     address. This keeps the instrumented locations stable across runs. */
++
++  if (cur_loc >= afl_inst_rms) return;
++
++  afl_area_ptr[cur_loc ^ prev_loc]++;
++
++}
++
++
++/* This code is invoked whenever QEMU decides that it doesn't have a
++   translation of a particular block and needs to compute it. When this happens,
++   we tell the parent to mirror the operation, so that the next fork() has a
++   cached copy. */
++
++static void afl_request_tsl(target_ulong pc, target_ulong cb, uint64_t flags) {
++
++  struct afl_tsl t;
++
++  if (!afl_fork_child) return;
++  if (pc > afl_end_code || pc < afl_start_code)
++      return;
++
++  t.pc      = pc;
++  t.cs_base = cb;
++  t.flags   = flags;
++
++  if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
++    return;
++
++}
++
++static void afl_mark_cfg(target_ulong pc) {
++  CFGPoint cfg = {pc};
++  //printf("%s write %lx\n", __func__, pc);
++  if (write(TSL_FD, &cfg, sizeof(CFGPoint)) != sizeof(CFGPoint))
++      return;
++
++}
++
++static void afl_wait_cfg(int fd) {
++
++  CFGPoint cfg;
++
++  while (1) {
++
++    /* Broken pipe means it's time to return to the fork server routine. */
++    if (read(fd, &cfg, sizeof(CFGPoint)) != sizeof(CFGPoint))
++      break;
++
++    if (!cfg_htable_lookup(cfg.pc)) {
++    //printf("htable add %lx\n", cfg.pc);
++        cfg_htable_add(cfg.pc);
++    }
++
++  }
++
++  close(fd);
++}
++
++static void afl_wait_syscall(int fd) {
++
++  int num;
++  int syscall_num = 0;
++
++  int tmp_syscalls[PRE_SYS_NUM];
++  int i, p = 0;
++  while (1) {
++
++    //if (read(fd, &num, sizeof(int)) != sizeof(int))
++    if (read(fd, &num, 4) != 4)
++      break;
++    if(num == 202)
++        continue;
++    tmp_syscalls[p] = num;
++    p = (p + 1) % PRE_SYS_NUM;
++    syscall_num++;
++
++  }
++    for(i=0;i<PRE_SYS_NUM;i++) {
++        pre_syscalls[i] = tmp_syscalls[(i+p)%PRE_SYS_NUM];
++        //printf("syscall[%d]=%d ", i, pre_syscalls[i]);
++    }
++    //printf("\nqemu recv %d syscalls\n", syscall_num);
++
++  close(fd);
++}
++
++/* This is the other side of the same channel. Since timeouts are handled by
++   afl-fuzz simply killing the child, we can just wait until the pipe breaks. */
++
++static void afl_wait_tsl(CPUState *cpu, int fd) {
++
++  struct afl_tsl t;
++  TranslationBlock *tb;
++
++  while (1) {
++
++    /* Broken pipe means it's time to return to the fork server routine. */
++    if (read(fd, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
++      break;
++
++    tb = tb_htable_lookup(cpu, t.pc, t.cs_base, t.flags);
++
++    if(!tb) {
++      mmap_lock();
++      tb_lock();
++      tb_gen_code(cpu, t.pc, t.cs_base, t.flags, 0);
++      mmap_unlock();
++      tb_unlock();
++    }
++
++  }
++
++  close(fd);
++
++}
+diff --git a/afl-info.h b/afl-info.h
+new file mode 100644
+index 00000000..db3aa659
+--- /dev/null
++++ b/afl-info.h
+@@ -0,0 +1,14 @@
++
++#define SHM_ENV_VAR         "__AFL_SHM_ID"
++#define FORKSRV_FD          198
++#define MAP_SIZE_POW2       16
++#define MAP_SIZE            (1 << MAP_SIZE_POW2)
++#define PRE_SYS_NUM 50
++#define FUZZ_SYS_NUM 50
++
++#define STRACE_FD 192
++#define TSL_FD (FORKSRV_FD - 1)
++extern unsigned int afl_forksrv_pid;
++int check_ratio(void);
++void send_syscalls(int num);
++void record_fuzz_syscall(int num);
+diff --git a/build.sh b/build.sh
+index f9cd1fbf..06ef9a5e 100755
+--- a/build.sh
++++ b/build.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ CPU_TARGET=x86_64
+-CFLAGS="-O3 -ggdb" ./configure --disable-system \
++CFLAGS="-O2 -ggdb" ./configure --disable-system \
+   --enable-linux-user --disable-gtk --disable-sdl --disable-vnc \
+   --target-list="${CPU_TARGET}-linux-user" --enable-pie --enable-kvm || exit 1
+ make -j8
+diff --git a/configure b/configure
+index dd73cce6..53581d78 100755
+--- a/configure
++++ b/configure
+@@ -3855,7 +3855,7 @@ fi
+ # check if memfd is supported
+ memfd=no
+ cat > $TMPC << EOF
+-#include <sys/memfd.h>
++#include <sys/mman.h>
+ 
+ int main(void)
+ {
+diff --git a/include/exec/cpu-all.h b/include/exec/cpu-all.h
+index ffe43d56..9219c981 100644
+--- a/include/exec/cpu-all.h
++++ b/include/exec/cpu-all.h
+@@ -32,6 +32,7 @@
+ #define EXCP_HALTED     0x10003 /* cpu is halted (waiting for external event) */
+ #define EXCP_YIELD      0x10004 /* cpu wants to yield timeslice to another */
+ #define EXCP_ATOMIC     0x10005 /* stop-the-world and emulate atomic */
++#define EXCP_EXPLORE    0x10006 /* explore bad address because of inconsistent */
+ 
+ /* some important defines:
+  *
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index 79062882..e0750ecf 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -20,6 +20,8 @@
+ 
+ #define ELF_OSABI   ELFOSABI_SYSV
+ 
++abi_ulong afl_entry_point, afl_start_code, afl_end_code;
++
+ /* from personality.h */
+ 
+ /*
+@@ -2085,6 +2087,8 @@ static void load_elf_image(const char *image_name, int image_fd,
+     info->brk = 0;
+     info->elf_flags = ehdr->e_flags;
+ 
++    if (!afl_entry_point) afl_entry_point = info->entry;
++
+     for (i = 0; i < ehdr->e_phnum; i++) {
+         struct elf_phdr *eppnt = phdr + i;
+         if (eppnt->p_type == PT_LOAD) {
+@@ -2118,9 +2122,11 @@ static void load_elf_image(const char *image_name, int image_fd,
+             if (elf_prot & PROT_EXEC) {
+                 if (vaddr < info->start_code) {
+                     info->start_code = vaddr;
++                    if (!afl_start_code) afl_start_code = vaddr;
+                 }
+                 if (vaddr_ef > info->end_code) {
+                     info->end_code = vaddr_ef;
++                    if (!afl_end_code) afl_end_code = vaddr_ef;
+                 }
+             }
+             if (elf_prot & PROT_WRITE) {
+@@ -2177,6 +2183,7 @@ static void load_elf_image(const char *image_name, int image_fd,
+     mmap_unlock();
+ 
+     close(image_fd);
++    //printf("start %lx, end %lx, entry %lx\n", afl_start_code, afl_end_code, afl_entry_point);
+     return;
+ 
+  exit_read:
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 03666ef6..f81ee06b 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -36,6 +36,7 @@
+ #include "exec/log.h"
+ #include "trace/control.h"
+ #include "glib-compat.h"
++#include "qemu-cfg.h"
+ 
+ char *exec_path;
+ 
+@@ -199,6 +200,103 @@ static void set_idt(int n, unsigned int dpl)
+ }
+ #endif
+ 
++struct qht cfg_htable;
++int graph_edge_num;
++
++void cfg_htable_init(void)
++{
++    unsigned int mode = QHT_MODE_AUTO_RESIZE;
++
++    qht_init(&cfg_htable, CODE_GEN_HTABLE_SIZE, mode);
++}
++
++static uint32_t hash32(target_ulong pc) {
++    if (sizeof(target_ulong) == 64)
++        return (pc >> 32) ^ (pc & 0xffffffff);
++    return pc;
++}
++static bool cfg_cmp(const void *p, const void *d)
++{
++    const CFGPoint * cfg = p;
++    const uint64_t * pc = d;
++    if (cfg->pc == *pc)
++        return true;
++    return false;
++}
++
++CFGPoint* cfg_htable_lookup(target_ulong pc)
++{
++    uint32_t h = hash32(pc);
++    CFGPoint* ret = qht_lookup(&cfg_htable, cfg_cmp, &pc, h);
++    return ret;
++}
++
++void cfg_htable_add(target_ulong pc) {
++    uint32_t h = hash32(pc);
++    CFGPoint * cfg_ptr = malloc(sizeof(CFGPoint));
++    cfg_ptr->pc = pc;
++    qht_insert(&cfg_htable, cfg_ptr, h);
++}
++
++void graph_add_edge(uint64_t pc1, uint64_t pc2) {
++    //printf("%s %#lx=>%#lx\n", __func__, pc1, pc2);
++    graph_edge_num++;
++}
++
++BranchList branch_list;
++int cfg_explore;
++int do_cfg = 0;
++
++void branch_list_init(void)
++{
++    QLIST_INIT(&branch_list.branches);
++}   
++    
++void branch_list_add(CPUArchState *env, uint64_t pc)
++{
++    Branch * branch = malloc(sizeof(Branch));
++    branch->pc = pc;
++    branch->env = *env;
++    QLIST_INSERT_HEAD(&branch_list.branches, branch, node);
++}
++    
++void branch_remove(Branch *branch)
++{
++    QLIST_REMOVE(branch, node);
++}
++
++Branch * branch_list_pop(void)
++{
++    Branch * ret = (QLIST_FIRST(&branch_list.branches));
++    branch_remove(ret);
++    return ret;
++}
++
++bool branch_list_empty(void)
++{
++    return QLIST_EMPTY(&branch_list.branches);
++}
++
++void restore_last_branch(CPUX86State *old_env)
++{
++    if(!branch_list_empty())
++    {
++        //reload cpu state
++        Branch * last = branch_list_pop();
++        *old_env = last->env;
++        old_env->eip = last->pc;
++
++        //printf("restore: %#lx\n", old_env->eip);
++        free(last);
++    } else {
++        printf("cfg explore end, edge num is %d\n", graph_edge_num);
++        exit(0);
++    }
++}
++
++extern int critical_signal;
++int no_exit = 0;
++extern target_ulong afl_start_code, afl_end_code;
+ void cpu_loop(CPUX86State *env)
+ {
+     CPUState *cs = CPU(x86_env_get_cpu(env));
+@@ -206,6 +304,17 @@ void cpu_loop(CPUX86State *env)
+     abi_ulong pc;
+     abi_ulong ret;
+     target_siginfo_t info;
++    branch_list_init();
++    cfg_htable_init();
++    graph_edge_num = 0;
++    //afl_start_code = 0x40000006ca;
++    //afl_end_code = 0x4000000741;
++    goto cpu_exec;
++
++cfg_explore:
++    restore_last_branch(env);
++
++cpu_exec:
+ 
+     for(;;) {
+         cpu_exec_start(cs);
+@@ -213,6 +322,9 @@ void cpu_loop(CPUX86State *env)
+         cpu_exec_end(cs);
+         process_queued_cpu_work(cs);
+ 
++        if(trapnr == EXCP_EXPLORE)
++            goto cfg_explore;
++
+         switch(trapnr) {
+         case 0x80:
+             /* linux syscall from int $0x80 */
+@@ -234,6 +346,12 @@ void cpu_loop(CPUX86State *env)
+ #ifndef TARGET_ABI32
+         case EXCP_SYSCALL:
+             /* linux syscall from syscall instruction */
++            if(do_cfg && env->regs[R_EAX] == TARGET_NR_exit_group) //exit_group syscall
++            {
++                no_exit = 1;
++                cfg_explore = 1;
++                goto cfg_explore;
++            }
+             ret = do_syscall(env,
+                              env->regs[R_EAX],
+                              env->regs[R_EDI],
+@@ -367,6 +485,11 @@ void cpu_loop(CPUX86State *env)
+             abort();
+         }
+         process_pending_signals(env);
++#if 1
++        if (do_cfg && critical_signal) {
++            goto cfg_explore;
++        }
++#endif
+     }
+ }
+ #endif
+@@ -4003,6 +4126,17 @@ static void handle_arg_strace(const char *arg)
+     do_strace = 1;
+ }
+ 
++static void handle_fuzz_strace(const char *arg)
++{
++    pre_strace = 0;
++    fuzz_strace = 0;
++}
++
++static void handle_arg_cfg(const char *arg)
++{
++    do_cfg = 1;
++}
++
+ static void handle_arg_version(const char *arg)
+ {
+     printf("qemu-" TARGET_NAME " version " QEMU_VERSION QEMU_PKGVERSION
+@@ -4062,6 +4196,10 @@ static const struct qemu_argument arg_table[] = {
+      "",           "run in singlestep mode"},
+     {"strace",     "QEMU_STRACE",      false, handle_arg_strace,
+      "",           "log system calls"},
++    {"fuzz",     "QEMU_FUZZ",      false, handle_fuzz_strace,
++      "",           "start qemu with afl-fuzz mode"},
++    {"cfg",     "GET_CFG",      false, handle_arg_cfg,
++     "",           "get cfg of binary input"},
+     {"seed",       "QEMU_RAND_SEED",   true,  handle_arg_randseed,
+      "",           "Seed for pseudo-random number generator"},
+     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
+@@ -4859,6 +4997,7 @@ int main(int argc, char **argv, char **envp)
+         }
+         gdb_handlesig(cpu, 0);
+     }
++    cfg_explore = 0;
+     cpu_loop(env);
+     /* never exits */
+     return 0;
+diff --git a/linux-user/qemu.h b/linux-user/qemu.h
+index 4edd7d0c..a6203d13 100644
+--- a/linux-user/qemu.h
++++ b/linux-user/qemu.h
+@@ -17,6 +17,7 @@
+ #include "target_syscall.h"
+ #include "exec/gdbstub.h"
+ #include "qemu/queue.h"
++#include "afl-info.h"
+ 
+ #define THREAD __thread
+ 
+@@ -364,6 +365,7 @@ int host_to_target_waitstatus(int status);
+ void print_syscall(int num,
+                    abi_long arg1, abi_long arg2, abi_long arg3,
+                    abi_long arg4, abi_long arg5, abi_long arg6);
++void print_simple_syscall(int num);
+ void print_syscall_ret(int num, abi_long arg1);
+ /**
+  * print_taken_signal:
+@@ -376,6 +378,10 @@ void print_syscall_ret(int num, abi_long arg1);
+  */
+ void print_taken_signal(int target_signum, const target_siginfo_t *tinfo);
+ extern int do_strace;
++extern int pre_strace;
++extern int fuzz_strace;
++extern int pre_syscalls[PRE_SYS_NUM];
++extern int fuzz_syscalls[FUZZ_SYS_NUM];
+ 
+ /* signal.c */
+ void process_pending_signals(CPUArchState *cpu_env);
+diff --git a/linux-user/signal.c b/linux-user/signal.c
+index cc0c3fce..12afcec6 100644
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -6553,6 +6553,9 @@ long do_rt_sigreturn(CPUArchState *env)
+ 
+ #endif
+ 
++extern int cfg_explore;
++int critical_signal;
++
+ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+                                   struct emulated_sigtable *k)
+ {
+@@ -6562,6 +6565,7 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+     target_sigset_t target_old_set;
+     struct target_sigaction *sa;
+     TaskState *ts = cpu->opaque;
++    critical_signal = 0;
+ 
+     trace_user_handle_signal(cpu_env, sig);
+     /* dequeue signal */
+@@ -6579,7 +6583,6 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+     if (do_strace) {
+         print_taken_signal(sig, &k->info);
+     }
+-
+     if (handler == TARGET_SIG_DFL) {
+         /* default handler : ignore some signal. The other are job control or fatal */
+         if (sig == TARGET_SIGTSTP || sig == TARGET_SIGTTIN || sig == TARGET_SIGTTOU) {
+@@ -6588,11 +6591,19 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
+                    sig != TARGET_SIGURG &&
+                    sig != TARGET_SIGWINCH &&
+                    sig != TARGET_SIGCONT) {
++            if (cfg_explore) {
++                critical_signal = 1;
++                return;
++            }
+             dump_core_and_abort(sig);
+         }
+     } else if (handler == TARGET_SIG_IGN) {
+         /* ignore sig */
+     } else if (handler == TARGET_SIG_ERR) {
++        if (cfg_explore) {
++            critical_signal = 1;
++            return;
++        }
+         dump_core_and_abort(sig);
+     } else {
+         /* compute the blocked signals during the handler execution */
+@@ -6672,6 +6683,8 @@ void process_pending_signals(CPUArchState *cpu_env)
+             }
+ 
+             handle_pending_signal(cpu_env, sig, &ts->sync_signal);
++            if(critical_signal)
++                return;
+         }
+ 
+         for (sig = 1; sig <= TARGET_NSIG; sig++) {
+diff --git a/linux-user/strace.c b/linux-user/strace.c
+index d821d165..006676fa 100644
+--- a/linux-user/strace.c
++++ b/linux-user/strace.c
+@@ -12,6 +12,54 @@
+ #include "qemu.h"
+ 
+ int do_strace=0;
++int pre_strace=0;
++int fuzz_strace=0;
++int fuzz_normal=0;
++
++int pre_syscalls[PRE_SYS_NUM] = {0};
++int fuzz_syscalls[FUZZ_SYS_NUM] = {0};
++int fuzz_strace_p = 0;
++
++void print_syscall_array(int * array, int num);
++
++// send syscalls
++void send_syscalls(int num) {
++    if(write(TSL_FD, &num, 4) != 4)
++        exit(2);
++}
++
++// record fuzz syscalls
++void record_fuzz_syscall(int num) {
++    if(num == 202)
++        return;
++    fuzz_syscalls[fuzz_strace_p] = num;
++    fuzz_strace_p = (fuzz_strace_p + 1) % FUZZ_SYS_NUM;
++}
++// compute the lms of syscalls
++int check_ratio(void) {
++    int i, j;
++    double ratio = 0.7;
++    int sim[PRE_SYS_NUM+1][FUZZ_SYS_NUM+1] = {0};
++    int order_fuzz_syscalls[FUZZ_SYS_NUM];
++    for(i=0;i<FUZZ_SYS_NUM;i++)
++        order_fuzz_syscalls[i] = fuzz_syscalls[(i+fuzz_strace_p)%FUZZ_SYS_NUM];
++    for(i = 1; i <= PRE_SYS_NUM; i++)
++        for(j = 1; j <= FUZZ_SYS_NUM; j++)
++            if(pre_syscalls[i-1] == order_fuzz_syscalls[j-1])
++                sim[i][j] = sim[i-1][j-1] + 1;
++            else
++                sim[i][j] = sim[i-1][j] > sim[i][j-1] ? sim[i-1][j] : sim[i][j-1];
++
++    if (sim[PRE_SYS_NUM][FUZZ_SYS_NUM] >= ratio * FUZZ_SYS_NUM)
++    {
++#if 0
++        printf("find end...\n");
++        print_syscall_array(order_fuzz_syscalls, FUZZ_SYS_NUM);
++#endif
++        return 1;
++    }
++    return 0;
++}
+ 
+ struct syscallname {
+     int nr;
+@@ -2618,7 +2666,14 @@ print_syscall(int num,
+         }
+     gemu_log("Unknown syscall %d\n", num);
+ }
+-
++void print_syscall_array(int * array, int num) {
++    int i, j;
++    for(i=0;i<num;i++)
++        for(j=0;j<nsyscalls;j++)
++            if(scnames[j].nr == array[i])
++                printf("[%d, %s]", array[i], scnames[j].name);
++    printf("\n");
++}
+ 
+ void
+ print_syscall_ret(int num, abi_long ret)
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 03ebe392..622ab830 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -116,6 +116,8 @@ int __clone2(int (*fn)(void *), void *child_stack_base,
+ 
+ #include "qemu.h"
+ 
++unsigned int afl_forksrv_pid;
++
+ #ifndef CLONE_IO
+ #define CLONE_IO                0x80000000      /* Clone io context */
+ #endif
+@@ -7722,8 +7724,16 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
+     gemu_log("syscall %d", num);
+ #endif
+     trace_guest_user_syscall(cpu, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+-    if(do_strace) {
++    if(do_strace)
+         print_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6);
++    if(pre_strace) {
++        send_syscalls(num);
++    }
++    else if(fuzz_strace) {
++        record_fuzz_syscall(num);
++        if(check_ratio()) {
++            exit(0);
++        }
+     }
+ 
+     switch(num) {
+@@ -11689,8 +11699,21 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
+         break;
+ 
+     case TARGET_NR_tgkill:
+-        ret = get_errno(safe_tgkill((int)arg1, (int)arg2,
+-                        target_to_host_signal(arg3)));
++
++        {
++          int pid  = (int)arg1,
++              tgid = (int)arg2,
++              sig  = (int)arg3;
++
++          /* Not entirely sure if the below is correct for all architectures. */
++
++          if(afl_forksrv_pid && afl_forksrv_pid == pid && sig == SIGABRT)
++              pid = tgid = getpid();
++
++          ret = get_errno(safe_tgkill(pid, tgid, target_to_host_signal(sig)));
++
++        }
++
+         break;
+ 
+ #ifdef TARGET_NR_set_robust_list
+diff --git a/qemu-cfg.h b/qemu-cfg.h
+new file mode 100644
+index 00000000..d352cebc
+--- /dev/null
++++ b/qemu-cfg.h
+@@ -0,0 +1,47 @@
++#ifndef QEMU_CFG_H
++#define QEMU_CFG_H
++//#include <stdint.h>
++#include "qemu/queue.h"
++#include "qemu/typedefs.h"
++
++typedef struct CFGPoint CFGPoint;
++typedef struct Branch Branch;
++
++struct CFGPoint
++{
++    uint64_t pc;
++};
++void cfg_htable_init(void);
++
++CFGPoint* cfg_htable_lookup(target_ulong pc);
++void cfg_htable_add(target_ulong);
++
++void graph_add_edge(uint64_t, uint64_t);
++
++
++struct Branch
++{
++    uint64_t pc;
++    //X86CPU cpu;
++    CPUArchState env;
++    //int gray;
++    QLIST_ENTRY(Branch) node;
++    //void (*save_state)(CPUState * state);
++    //void (*load_state)(void);
++};
++
++typedef struct BranchList
++{
++    QLIST_HEAD(, Branch) branches;
++} BranchList;
++
++//QLIST_INIT(branch_stack);
++void branch_list_init(void);
++    
++void branch_list_add(CPUArchState * env, uint64_t pc);
++    
++void branch_remove(Branch *branch);
++Branch * branch_list_pop(void);
++bool branch_list_empty(void);
++void restore_last_branch(CPUX86State *old_env);
++#endif
+diff --git a/roms/seabios/config.mak b/roms/seabios/config.mak
+deleted file mode 100644
+index 512d9ca0..00000000
+--- a/roms/seabios/config.mak
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# Automatically generated by configure - do not modify
+-SRC_PATH=/home/lius/nocoo/qemu-orign/roms/seabios
+-AS=as
+-CCAS=cc
+-CC=cc
+-BCC=bcc
+-CPP=cc -E
+-OBJCOPY=objcopy
+-IASL=iasl
+-LD=ld
+diff --git a/roms/vgabios/config.mak b/roms/vgabios/config.mak
+deleted file mode 100644
+index bf3f8a2e..00000000
+--- a/roms/vgabios/config.mak
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# Automatically generated by configure - do not modify
+-SRC_PATH=/home/lius/nocoo/qemu-orign/roms/vgabios
+-AS=as
+-CCAS=cc
+-CC=cc
+-BCC=bcc
+-CPP=cc -E
+-OBJCOPY=objcopy
+-IASL=iasl
+-LD=ld
+diff --git a/target/i386/translate.c b/target/i386/translate.c
+index 5fdadf98..cad1dbe9 100644
+--- a/target/i386/translate.c
++++ b/target/i386/translate.c
+@@ -31,6 +31,8 @@
+ #include "trace-tcg.h"
+ #include "exec/log.h"
+ 
++bool jmp_exit;
++target_ulong jmp_pc1, jmp_pc2;
+ 
+ #define PREFIX_REPZ   0x01
+ #define PREFIX_REPNZ  0x02
+@@ -2160,6 +2162,9 @@ static inline void gen_goto_tb(DisasContext *s, int tb_num, target_ulong eip)
+     }
+ }
+ 
++extern abi_ulong afl_start_code, afl_end_code;
++extern int do_cfg;
++
+ static inline void gen_jcc(DisasContext *s, int b,
+                            target_ulong val, target_ulong next_eip)
+ {
+@@ -2174,6 +2179,13 @@ static inline void gen_jcc(DisasContext *s, int b,
+         gen_set_label(l1);
+         gen_goto_tb(s, 1, val);
+         s->is_jmp = DISAS_TB_JUMP;
++        if(do_cfg && s->pc >= afl_start_code && s->pc <= afl_end_code)
++        {
++            jmp_pc1 = next_eip;
++            jmp_pc2 = val;
++            jmp_exit = 1;
++        }
++
+     } else {
+         l1 = gen_new_label();
+         l2 = gen_new_label();
+diff --git a/util/memfd.c b/util/memfd.c
+index d9c1657c..108e7194 100644
+--- a/util/memfd.c
++++ b/util/memfd.c
+@@ -31,9 +31,7 @@
+ 
+ #include "qemu/memfd.h"
+ 
+-#ifdef CONFIG_MEMFD
+-#include <sys/memfd.h>
+-#elif defined CONFIG_LINUX
++#if defined CONFIG_LINUX && !defined CONFIG_MEMFD
+ #include <sys/syscall.h>
+ #include <asm/unistd.h>
+ 

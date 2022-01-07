@@ -1,0 +1,417 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 21918df..47244be 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -90,7 +90,6 @@
+ /* Lots of globals, but mostly for the status UI and other things where it
+    really makes no sense to haul them around as function parameters. */
+ 
+-
+ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
+           *out_file,                  /* File to fuzz, if any             */
+           *out_dir,                   /* Working & output directory       */
+@@ -142,7 +141,9 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
+            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
+            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
+            fsrv_ctl_fd,               /* Fork server control pipe (write) */
+-           fsrv_st_fd;                /* Fork server status pipe (read)   */
++           fsrv_st_fd,                /* Fork server status pipe (read)   */
++           recv_fd,
++           send_fd;
+ 
+ static s32 forksrv_pid,               /* PID of the fork server           */
+            child_pid = -1,            /* PID of the fuzzed program        */
+@@ -238,6 +239,14 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
+ 
+ static FILE* plot_file;               /* Gnuplot output file              */
+ 
++#define FUZZ_STRACE 2
++#define PRE_STRACE 1
++#define NORMAL 3
++#define CFG 0
++static int first_pre_strace = 1;
++static int first_cfg = 1;
++static int cur_mode = 0;
++
+ struct queue_entry {
+ 
+   u8* fname;                          /* File name for the test case      */
+@@ -2002,16 +2011,17 @@ static void destroy_extras(void) {
+    cloning a stopped child. So, we just execute once, and then send commands
+    through a pipe. The other part of this logic is in afl-as.h. */
+ 
+-EXP_ST void init_forkserver(char** argv) {
++EXP_ST void init_forkserver(char** argv)
++{
+ 
+   static struct itimerval it;
+-  int st_pipe[2], ctl_pipe[2];
++  int st_pipe[2], ctl_pipe[2], recv_pipe[2], send_pipe[2];
+   int status;
+   s32 rlen;
+ 
+   ACTF("Spinning up the fork server...");
+ 
+-  if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
++  if (pipe(st_pipe) || pipe(ctl_pipe) || pipe(recv_pipe) || pipe(send_pipe)) PFATAL("pipe() failed");
+ 
+   forksrv_pid = fork();
+ 
+@@ -2064,7 +2074,7 @@ EXP_ST void init_forkserver(char** argv) {
+ 
+     setsid();
+ 
+-    dup2(dev_null_fd, 1);
++    //dup2(dev_null_fd, 1);
+     dup2(dev_null_fd, 2);
+ 
+     if (out_file) {
+@@ -2113,7 +2123,7 @@ EXP_ST void init_forkserver(char** argv) {
+                            "abort_on_error=1:"
+                            "allocator_may_return_null=1:"
+                            "msan_track_origins=0", 0);
+-
++    //printf("%s %d: %s %s %s %s %s\n", __func__, __LINE__, target_path, argv[0], argv[1], argv[2], argv[3]);
+     execv(target_path, argv);
+ 
+     /* Use a distinctive bitmap signature to tell the parent about execv()
+@@ -2128,9 +2138,14 @@ EXP_ST void init_forkserver(char** argv) {
+ 
+   close(ctl_pipe[0]);
+   close(st_pipe[1]);
++  close(recv_pipe[1]);
++  close(send_pipe[0]);
+ 
+   fsrv_ctl_fd = ctl_pipe[1];
+   fsrv_st_fd  = st_pipe[0];
++  recv_fd = recv_pipe[0];
++  send_fd = send_pipe[1];
++  //printf("fuzzer keep %d,%d,%d,%d\n", fsrv_ctl_fd, fsrv_st_fd, recv_fd, send_fd);
+ 
+   /* Wait for the fork server to come up, but don't wait too long. */
+ 
+@@ -2148,7 +2163,6 @@ EXP_ST void init_forkserver(char** argv) {
+ 
+   /* If we have a four-byte "hello" message from the server, we're all set.
+      Otherwise, try to figure out what went wrong. */
+-
+   if (rlen == 4) {
+     OKF("All right - fork server is up.");
+     return;
+@@ -2287,7 +2301,8 @@ EXP_ST void init_forkserver(char** argv) {
+ /* Execute target application, monitoring for timeouts. Return status
+    information. The called program will update trace_bits[]. */
+ 
+-static u8 run_target(char** argv, u32 timeout) {
++static u8 _run_target(char** argv, u32 timeout, u32 mode)
++{
+ 
+   static struct itimerval it;
+   static u32 prev_timed_out = 0;
+@@ -2376,7 +2391,6 @@ static u8 run_target(char** argv, u32 timeout) {
+       setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
+                              "symbolize=0:"
+                              "msan_track_origins=0", 0);
+-
+       execv(target_path, argv);
+ 
+       /* Use a distinctive bitmap value to tell the parent about execv()
+@@ -2393,8 +2407,7 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+     /* In non-dumb mode, we have the fork server up and running, so simply
+        tell it to have at it, and then read back PID. */
+-
+-    if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
++    if ((res = write(fsrv_ctl_fd, &mode, 4)) != 4) {
+ 
+       if (stop_soon) return 0;
+       RPFATAL(res, "Unable to request new process from fork server (OOM?)");
+@@ -2414,9 +2427,12 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+   /* Configure timeout, as requested by user, then wait for child to terminate. */
+ 
++  if (mode == CFG)
++    timeout = 5000;
++  if (mode == PRE_STRACE)
++    timeout = 3000;
+   it.it_value.tv_sec = (timeout / 1000);
+   it.it_value.tv_usec = (timeout % 1000) * 1000;
+-
+   setitimer(ITIMER_REAL, &it, NULL);
+ 
+   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
+@@ -2425,6 +2441,7 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
+ 
++
+   } else {
+ 
+     s32 res;
+@@ -2473,7 +2490,9 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+     kill_signal = WTERMSIG(status);
+ 
+-    if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
++    if (child_timed_out && kill_signal == SIGKILL) {
++        return FAULT_TMOUT;
++    }
+ 
+     return FAULT_CRASH;
+ 
+@@ -2500,13 +2519,31 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+ }
+ 
++static u8 run_target(char** argv, u32 timeout)
++{
++    if(first_cfg) {
++        cur_mode = CFG;
++        first_cfg = 0;
++        return _run_target(argv, exec_tmout, CFG);
++    }
++    else if(first_pre_strace) {
++        cur_mode = PRE_STRACE;
++        first_pre_strace = 0;
++        return _run_target(argv, exec_tmout, PRE_STRACE);
++    }
++    else if(cur_mode == FUZZ_STRACE) {
++        return _run_target(argv, timeout, FUZZ_STRACE);
++    }
++    cur_mode = NORMAL;
++    return _run_target(argv, timeout, NORMAL);
++}
+ 
+ /* Write modified data to file for testing. If out_file is set, the old file
+    is unlinked and a new one is created. Otherwise, out_fd is rewound and
+    truncated. */
+ 
+-static void write_to_testcase(void* mem, u32 len) {
+-
++static void write_to_testcase(void* mem, u32 len)
++{
+   s32 fd = out_fd;
+ 
+   if (out_file) {
+@@ -2518,7 +2555,6 @@ static void write_to_testcase(void* mem, u32 len) {
+     if (fd < 0) PFATAL("Unable to create '%s'", out_file);
+ 
+   } else lseek(fd, 0, SEEK_SET);
+-
+   ck_write(fd, mem, len, out_file);
+ 
+   if (!out_file) {
+@@ -2569,7 +2605,8 @@ static void show_stats(void);
+    new paths are discovered to detect variable behavior and so on. */
+ 
+ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
+-                         u32 handicap, u8 from_queue) {
++                         u32 handicap, u8 from_queue)
++{                         
+ 
+   static u8 first_trace[MAP_SIZE];
+ 
+@@ -2600,7 +2637,6 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
+ 
+   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
+     init_forkserver(argv);
+-
+   if (q->exec_cksum) {
+ 
+     memcpy(first_trace, trace_bits, MAP_SIZE);
+@@ -2616,14 +2652,23 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
+     u32 cksum;
+ 
+     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
+-
+     write_to_testcase(use_mem, q->len);
+-
+     fault = run_target(argv, use_tmout);
++    if (cur_mode == CFG) {
++        stage_cur--;
++        continue;
++    } else if (cur_mode == PRE_STRACE) {
++        if (fault == FAULT_TMOUT) {
++            printf("%s PRE_STRACE timeout, then goto FUZZ_STRACE mode\n", __func__);
++            cur_mode = FUZZ_STRACE;
++        } else 
++            cur_mode = NORMAL;
++        //stage_cur--;
++        continue;
++    }
+ 
+     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
+        we want to bail out quickly. */
+-
+     if (stop_soon || fault != crash_mode) goto abort_calibration;
+ 
+     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
+@@ -2688,7 +2733,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
+      parent. This is a non-critical problem, but something to warn the user
+      about. */
+ 
+-  if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
++  if (!dumb_mode && first_run && !fault && !new_bits && cur_mode != CFG && cur_mode != PRE_STRACE)
++      fault = FAULT_NOBITS;
+ 
+ abort_calibration:
+ 
+@@ -2740,8 +2786,8 @@ static void check_map_coverage(void) {
+ /* Perform dry run of all test cases to confirm that the app is working as
+    expected. This is done only for the initial inputs, and only once. */
+ 
+-static void perform_dry_run(char** argv) {
+-
++static void perform_dry_run(char** argv)
++{
+   struct queue_entry* q = queue;
+   u32 cal_failures = 0;
+   u8* skip_crashes = getenv("AFL_SKIP_CRASHES");
+@@ -2786,7 +2832,7 @@ static void perform_dry_run(char** argv) {
+         break;
+ 
+       case FAULT_TMOUT:
+-
++        
+         if (timeout_given) {
+ 
+           /* The -t nn+ syntax in the command line sets timeout_given to '2' and
+@@ -3160,7 +3206,8 @@ static void write_crash_readme(void) {
+    save or queue the input test case for further analysis if so. Returns 1 if
+    entry is saved, 0 otherwise. */
+ 
+-static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
++static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault)
++{
+ 
+   u8  *fn = "";
+   u8  hnb;
+@@ -3931,7 +3978,6 @@ static void check_term_size(void);
+    execve() calls, plus in several other circumstances. */
+ 
+ static void show_stats(void) {
+-
+   static u64 last_stats_ms, last_plot_ms, last_ms, last_execs;
+   static double avg_exec;
+   double t_byte_ratio, stab_ratio;
+@@ -4057,7 +4103,7 @@ static void show_stats(void) {
+ 
+   sprintf(tmp + banner_pad, "%s " cLCY VERSION cLGN
+           " (%s)",  crash_mode ? cPIN "peruvian were-rabbit" : 
+-          cYEL "american fuzzy lop", use_banner);
++          cYEL "uncoo fuzz", use_banner);
+ 
+   SAYF("\n%s\n\n", tmp);
+ 
+@@ -4523,7 +4569,8 @@ static u32 next_p2(u32 val) {
+    trimmer uses power-of-two increments somewhere between 1/16 and 1/1024 of
+    file size, to keep the stage short and sweet. */
+ 
+-static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
++static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf)
++{
+ 
+   static u8 tmp[64];
+   static u8 clean_trace[MAP_SIZE];
+@@ -4647,10 +4694,10 @@ abort_trimming:
+    error conditions, returning 1 if it's time to bail out. This is
+    a helper function for fuzz_one(). */
+ 
+-EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
++EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len)
++{
+ 
+   u8 fault;
+-
+   if (post_handler) {
+ 
+     out_buf = post_handler(out_buf, &len);
+@@ -5000,7 +5047,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
+    function is a tad too long... returns 0 if fuzzed successfully, 1 if
+    skipped or bailed out. */
+ 
+-static u8 fuzz_one(char** argv) {
++static u8 fuzz_one(char** argv)
++{
+ 
+   s32 len, fd, temp_len, i, j;
+   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
+@@ -5011,7 +5059,6 @@ static u8 fuzz_one(char** argv) {
+ 
+   u8  a_collect[MAX_AUTO_EXTRA];
+   u32 a_len = 0;
+-
+ #ifdef IGNORE_FINDS
+ 
+   /* In IGNORE_FINDS mode, skip any entries that weren't in the
+@@ -6692,7 +6739,8 @@ abandon_entry:
+ 
+ /* Grab interesting test cases from other fuzzers. */
+ 
+-static void sync_fuzzers(char** argv) {
++static void sync_fuzzers(char** argv)
++{
+ 
+   DIR* sd;
+   struct dirent* sd_ent;
+@@ -6851,7 +6899,6 @@ static void handle_skipreq(int sig) {
+ /* Handle timeout (SIGALRM). */
+ 
+ static void handle_timeout(int sig) {
+-
+   if (child_pid > 0) {
+ 
+     child_timed_out = 1; 
+@@ -7684,7 +7731,7 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
+   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
+ 
+   new_argv[2] = target_path;
+-  new_argv[1] = "--";
++  new_argv[1] = "-fuzz";
+ 
+   /* Now we need to actually find the QEMU binary to put in argv[0]. */
+ 
+@@ -7775,7 +7822,8 @@ static void save_cmdline(u32 argc, char** argv) {
+ 
+ /* Main entry point */
+ 
+-int main(int argc, char** argv) {
++int main(int argc, char** argv)
++{
+ 
+   s32 opt;
+   u64 prev_queued = 0;
+@@ -7788,7 +7836,7 @@ int main(int argc, char** argv) {
+   struct timeval tv;
+   struct timezone tz;
+ 
+-  SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
++  //SAYF(cCYA "afl-fuzz " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
+ 
+   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
+ 
+@@ -8062,9 +8110,9 @@ int main(int argc, char** argv) {
+ 
+   start_time = get_cur_time();
+ 
+-  if (qemu_mode)
++  if (qemu_mode) {
+     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+-  else
++  } else
+     use_argv = argv + optind;
+ 
+   perform_dry_run(use_argv);
+diff --git a/config.h b/config.h
+index 46dd857..c365dda 100644
+--- a/config.h
++++ b/config.h
+@@ -28,7 +28,7 @@
+ 
+ /* Version string: */
+ 
+-#define VERSION             "2.57b"
++#define VERSION    "alpha"       
+ 
+ /******************************************************
+  *                                                    *
